@@ -1,0 +1,452 @@
+// optical-flow.effect — real-time pyramidal block-matching optical flow +
+// motion-compensated frame interpolation for OBS Studio.
+//
+// Written in the OBS effect dialect (HLSL-like, transpiled to GLSL/Metal).
+// All passes are single-render-target fragment work; loops use constant
+// bounds so the transpiled GLSL compiles everywhere.
+//
+// Flow vectors are stored in UV units (0..1 across the texture) so they can
+// be sampled across pyramid levels without rescaling.
+// Flow texture layout: xy = forward flow (A -> B), zw = backward flow (B -> A).
+
+uniform float4x4 ViewProj;
+
+uniform texture2d image;         // primary input of the current pass
+uniform texture2d image2;        // secondary input (frame B / reference)
+uniform texture2d flow_tex;      // final flow field (Interp / DebugFlow)
+uniform texture2d prev_flow;     // coarser pyramid level's flow (Motion)
+uniform texture2d temporal_flow; // last frame pair's flow (Motion, coarsest)
+
+uniform float2 texel;            // texel size of the pass input
+uniform float2 flow_texel;       // texel size of prev_flow
+uniform float2 frame_px;         // source size in pixels (Interp)
+uniform float t_phase;           // interpolation phase 0..1
+uniform float has_prev;          // 1 = prev_flow valid (finer pyramid levels)
+uniform float has_temporal;      // 1 = temporal_flow valid
+uniform float fine_pass;         // 1 = finest level (adds subpixel refine)
+uniform float occl_k;            // occlusion sensitivity
+uniform float strength;          // interpolation strength 0..1
+uniform float flow_quant;        // flow quantisation step in source px
+uniform float debug_mag;         // flow visualisation gain
+
+sampler_state smpLinear {
+	Filter    = Linear;
+	AddressU  = Clamp;
+	AddressV  = Clamp;
+};
+
+sampler_state smpPoint {
+	Filter    = Point;
+	AddressU  = Clamp;
+	AddressV  = Clamp;
+};
+
+struct VertData {
+	float4 pos : POSITION;
+	float2 uv  : TEXCOORD0;
+};
+
+VertData VSDefault(VertData v_in)
+{
+	VertData vert_out;
+	vert_out.pos = mul(float4(v_in.pos.xyz, 1.0), ViewProj);
+	vert_out.uv = v_in.uv;
+	return vert_out;
+}
+
+float lum(float4 c)
+{
+	return dot(c.rgb, float3(0.2126, 0.7152, 0.0722));
+}
+
+/* ------------------------------------------------------------------ */
+/* Pack: build pyramid level 0. R = luma(frame A), G = luma(frame B). */
+/* image = frame A (full res), image2 = frame B (full res),           */
+/* texel = full-res texel size.                                       */
+
+float4 PSPack(VertData v_in) : TARGET
+{
+	float2 o = texel;
+	float a = 0.0;
+	float b = 0.0;
+	a += lum(image.Sample(smpLinear, v_in.uv + float2(-o.x, -o.y)));
+	a += lum(image.Sample(smpLinear, v_in.uv + float2( o.x, -o.y)));
+	a += lum(image.Sample(smpLinear, v_in.uv + float2(-o.x,  o.y)));
+	a += lum(image.Sample(smpLinear, v_in.uv + float2( o.x,  o.y)));
+	b += lum(image2.Sample(smpLinear, v_in.uv + float2(-o.x, -o.y)));
+	b += lum(image2.Sample(smpLinear, v_in.uv + float2( o.x, -o.y)));
+	b += lum(image2.Sample(smpLinear, v_in.uv + float2(-o.x,  o.y)));
+	b += lum(image2.Sample(smpLinear, v_in.uv + float2( o.x,  o.y)));
+	return float4(a * 0.25, b * 0.25, 0.0, 1.0);
+}
+
+/* ------------------------------------------------------------------ */
+/* Down: 2:1 pyramid downsample of an RG luma texture.                */
+
+float4 PSDown(VertData v_in) : TARGET
+{
+	return float4(image.Sample(smpLinear, v_in.uv).rg, 0.0, 1.0);
+}
+
+/* ------------------------------------------------------------------ */
+/* Motion: one pyramid level of bidirectional block matching.         */
+/* image = RG luma pyramid level, texel = its texel size.             */
+/* Output: xy = forward flow, zw = backward flow (UV units).          */
+
+float sad_fwd(float2 uv, float2 mv)
+{
+	float s = 0.0;
+	for (int j = 0; j < 4; j++) {
+		for (int i = 0; i < 4; i++) {
+			float2 off = float2((float(i) - 1.5) * texel.x,
+					    (float(j) - 1.5) * texel.y);
+			float la = image.Sample(smpLinear, uv + off).r;
+			float lb = image.Sample(smpLinear, uv + mv + off).g;
+			s += abs(la - lb);
+		}
+	}
+	return s;
+}
+
+float sad_bwd(float2 uv, float2 mv)
+{
+	float s = 0.0;
+	for (int j = 0; j < 4; j++) {
+		for (int i = 0; i < 4; i++) {
+			float2 off = float2((float(i) - 1.5) * texel.x,
+					    (float(j) - 1.5) * texel.y);
+			float lb = image.Sample(smpLinear, uv + off).g;
+			float la = image.Sample(smpLinear, uv + mv + off).r;
+			s += abs(lb - la);
+		}
+	}
+	return s;
+}
+
+float4 PSMotion(VertData v_in) : TARGET
+{
+	float2 uv = v_in.uv;
+	float2 best_f = float2(0.0, 0.0);
+	float2 best_b = float2(0.0, 0.0);
+	float cost_f;
+	float cost_b;
+
+	/* --- candidate stage ------------------------------------- */
+	if (has_prev > 0.5) {
+		/* propagated candidates from the coarser level:
+		   center + 4 neighbours (helps flow edges) */
+		cost_f = 1e9;
+		cost_b = 1e9;
+		for (int k = 0; k < 5; k++) {
+			float2 po = float2(0.0, 0.0);
+			if (k == 1) po = float2(-1.5, 0.0);
+			if (k == 2) po = float2( 1.5, 0.0);
+			if (k == 3) po = float2(0.0, -1.5);
+			if (k == 4) po = float2(0.0,  1.5);
+			float4 pf = prev_flow.Sample(smpLinear, uv + po * flow_texel);
+			float cf = sad_fwd(uv, pf.xy);
+			float cb = sad_bwd(uv, pf.zw);
+			if (cf < cost_f) { cost_f = cf; best_f = pf.xy; }
+			if (cb < cost_b) { cost_b = cb; best_b = pf.zw; }
+		}
+		/* zero-motion candidate with a small additive bonus: locks
+		   static content (UI, text) to exactly zero motion */
+		float zf = sad_fwd(uv, float2(0.0, 0.0)) * 0.97 - 0.008;
+		float zb = sad_bwd(uv, float2(0.0, 0.0)) * 0.97 - 0.008;
+		if (zf < cost_f) { cost_f = zf; best_f = float2(0.0, 0.0); }
+		if (zb < cost_b) { cost_b = zb; best_b = float2(0.0, 0.0); }
+	} else {
+		/* coarsest level: zero candidate (with bonus) ... */
+		cost_f = sad_fwd(uv, float2(0.0, 0.0)) * 0.97 - 0.008;
+		cost_b = sad_bwd(uv, float2(0.0, 0.0)) * 0.97 - 0.008;
+		/* ... plus the temporal candidate from the previous
+		   frame pair (3-D recursive search idea) */
+		if (has_temporal > 0.5) {
+			float4 tf = temporal_flow.Sample(smpLinear, uv);
+			float cf = sad_fwd(uv, tf.xy);
+			float cb = sad_bwd(uv, tf.zw);
+			if (cf < cost_f) { cost_f = cf; best_f = tf.xy; }
+			if (cb < cost_b) { cost_b = cb; best_b = tf.zw; }
+		}
+	}
+
+	/* --- local refine ----------------------------------------- */
+	/* coarsest level: exhaustive 5x5 (r=2); finer levels: 3x3    */
+	float r = (has_prev > 0.5) ? 1.0 : 2.0;
+	float2 base_f = best_f;
+	float2 base_b = best_b;
+	for (int dy = -2; dy <= 2; dy++) {
+		for (int dx = -2; dx <= 2; dx++) {
+			if (dx == 0 && dy == 0)
+				continue;
+			if (abs(float(dx)) > r || abs(float(dy)) > r)
+				continue;
+			/* small step penalty: prefer coherent vectors */
+			float pen = 0.012 * (abs(float(dx)) + abs(float(dy)));
+			float2 d = float2(float(dx) * texel.x, float(dy) * texel.y);
+			float cf = sad_fwd(uv, base_f + d) + pen;
+			if (cf < cost_f) { cost_f = cf; best_f = base_f + d; }
+			float cb = sad_bwd(uv, base_b + d) + pen;
+			if (cb < cost_b) { cost_b = cb; best_b = base_b + d; }
+		}
+	}
+
+	/* --- subpixel refine (finest level only) ------------------- */
+	if (fine_pass > 0.5) {
+		base_f = best_f;
+		base_b = best_b;
+		for (int sy = -1; sy <= 1; sy++) {
+			for (int sx = -1; sx <= 1; sx++) {
+				if (sx == 0 && sy == 0)
+					continue;
+				float2 d2 = float2(float(sx) * 0.5 * texel.x,
+						   float(sy) * 0.5 * texel.y);
+				float cf2 = sad_fwd(uv, base_f + d2) + 0.006;
+				if (cf2 < cost_f) { cost_f = cf2; best_f = base_f + d2; }
+				float cb2 = sad_bwd(uv, base_b + d2) + 0.006;
+				if (cb2 < cost_b) { cost_b = cb2; best_b = base_b + d2; }
+			}
+		}
+	}
+
+	return float4(best_f, best_b);
+}
+
+/* ------------------------------------------------------------------ */
+/* SmoothFlow: component-wise 3x3 median on the flow field.           */
+/* image = flow field, texel = its texel size.                        */
+
+float4 PSSmoothFlow(VertData v_in) : TARGET
+{
+	float4 p0 = image.Sample(smpPoint, v_in.uv + float2(-texel.x, -texel.y));
+	float4 p1 = image.Sample(smpPoint, v_in.uv + float2(     0.0, -texel.y));
+	float4 p2 = image.Sample(smpPoint, v_in.uv + float2( texel.x, -texel.y));
+	float4 p3 = image.Sample(smpPoint, v_in.uv + float2(-texel.x,      0.0));
+	float4 p4 = image.Sample(smpPoint, v_in.uv);
+	float4 p5 = image.Sample(smpPoint, v_in.uv + float2( texel.x,      0.0));
+	float4 p6 = image.Sample(smpPoint, v_in.uv + float2(-texel.x,  texel.y));
+	float4 p7 = image.Sample(smpPoint, v_in.uv + float2(     0.0,  texel.y));
+	float4 p8 = image.Sample(smpPoint, v_in.uv + float2( texel.x,  texel.y));
+
+	/* classic 9-element median exchange network (component-wise) */
+	float4 t;
+	t = min(p1, p2); p2 = max(p1, p2); p1 = t;
+	t = min(p4, p5); p5 = max(p4, p5); p4 = t;
+	t = min(p7, p8); p8 = max(p7, p8); p7 = t;
+	t = min(p0, p1); p1 = max(p0, p1); p0 = t;
+	t = min(p3, p4); p4 = max(p3, p4); p3 = t;
+	t = min(p6, p7); p7 = max(p6, p7); p6 = t;
+	t = min(p1, p2); p2 = max(p1, p2); p1 = t;
+	t = min(p4, p5); p5 = max(p4, p5); p4 = t;
+	t = min(p7, p8); p8 = max(p7, p8); p7 = t;
+	t = min(p0, p3); p3 = max(p0, p3); p0 = t;
+	t = min(p5, p8); p8 = max(p5, p8); p5 = t;
+	t = min(p4, p7); p7 = max(p4, p7); p4 = t;
+	t = min(p3, p6); p6 = max(p3, p6); p3 = t;
+	t = min(p1, p4); p4 = max(p1, p4); p1 = t;
+	t = min(p2, p5); p5 = max(p2, p5); p2 = t;
+	t = min(p4, p7); p7 = max(p4, p7); p4 = t;
+	t = min(p4, p2); p2 = max(p4, p2); p4 = t;
+	t = min(p6, p4); p4 = max(p6, p4); p6 = t;
+	t = min(p4, p2); p2 = max(p4, p2); p4 = t;
+
+	return p4;
+}
+
+/* ------------------------------------------------------------------ */
+/* Interp: motion-compensated frame interpolation at phase t_phase.   */
+/* image = frame A, image2 = frame B (full res),                      */
+/* flow_tex = smoothed flow field, frame_px = source size in pixels.  */
+
+float4 PSInterp(VertData v_in) : TARGET
+{
+	float2 uv = v_in.uv;
+	float4 fl = flow_tex.Sample(smpLinear, uv);
+	float2 vf = fl.xy;
+	float2 vb = fl.zw;
+
+	/* forward/backward consistency (Sundaram-Brox style), in px.
+	 * flow_quant (px) is the flow field's quantisation step: fwd and bwd
+	 * searches round independently, so up to ~flow_quant of disagreement
+	 * is measurement noise, not occlusion — folded into the limit so
+	 * confidence does not collapse on slow pans. */
+	float4 flf = flow_tex.Sample(smpLinear, uv + vf);
+	float4 flb = flow_tex.Sample(smpLinear, uv + vb);
+	float2 ef_px = (vf + flf.zw) * frame_px;
+	float2 eb_px = (vb + flb.xy) * frame_px;
+	float2 vf_px = vf * frame_px;
+	float2 vb_px = vb * frame_px;
+	float qq = flow_quant * flow_quant;
+	float lim_f = 0.01 * (dot(vf_px, vf_px) + dot(flf.zw * frame_px, flf.zw * frame_px)) + 0.5 + qq;
+	float lim_b = 0.01 * (dot(vb_px, vb_px) + dot(flb.xy * frame_px, flb.xy * frame_px)) + 0.5 + qq;
+	float cf = exp(-occl_k * dot(ef_px, ef_px) / lim_f);
+	float cb = exp(-occl_k * dot(eb_px, eb_px) / lim_b);
+
+	/* motion-compensated samples.
+	 * A-pixel p lands at p + t*vf  ->  p ~ x - t*vf(x)
+	 * B-pixel q lands at q + (1-t)*vb  ->  q ~ x - (1-t)*vb(x) */
+	float4 colA = image.Sample(smpLinear, uv - vf * t_phase);
+	float4 colB = image2.Sample(smpLinear, uv - vb * (1.0 - t_phase));
+
+	float wa = (1.0 - t_phase) * cf;
+	float wb = t_phase * cb;
+	float4 mc = (colA * wa + colB * wb) / (wa + wb + 1e-6);
+
+	/* fallback: plain cross-fade where flow is unreliable */
+	float4 xa = image.Sample(smpLinear, uv);
+	float4 xb = image2.Sample(smpLinear, uv);
+	float4 xf = lerp(xa, xb, t_phase);
+
+	float conf = saturate(max(cf, cb));
+	return lerp(xf, mc, conf * strength);
+}
+
+/* ------------------------------------------------------------------ */
+/* Copy: passthrough.                                                 */
+
+float4 PSCopy(VertData v_in) : TARGET
+{
+	return image.Sample(smpLinear, v_in.uv);
+}
+
+/* ------------------------------------------------------------------ */
+/* Diff: tiny frame-difference map for new-frame detection.           */
+/* image = current capture, image2 = last stored frame,               */
+/* texel = QUARTER of the diff-cell pitch in UV (set by the host), so */
+/* the 4 taps spread across the whole cell regardless of source size. */
+/* Writes |dLuma| to r, g and b so the CPU readback works regardless  */
+/* of channel order.                                                  */
+
+float4 PSDiff(VertData v_in) : TARGET
+{
+	float2 o = texel;
+	float d = 0.0;
+	d += abs(lum(image.Sample(smpLinear, v_in.uv + float2(-o.x, -o.y))) -
+		 lum(image2.Sample(smpLinear, v_in.uv + float2(-o.x, -o.y))));
+	d += abs(lum(image.Sample(smpLinear, v_in.uv + float2( o.x, -o.y))) -
+		 lum(image2.Sample(smpLinear, v_in.uv + float2( o.x, -o.y))));
+	d += abs(lum(image.Sample(smpLinear, v_in.uv + float2(-o.x,  o.y))) -
+		 lum(image2.Sample(smpLinear, v_in.uv + float2(-o.x,  o.y))));
+	d += abs(lum(image.Sample(smpLinear, v_in.uv + float2( o.x,  o.y))) -
+		 lum(image2.Sample(smpLinear, v_in.uv + float2( o.x,  o.y))));
+	d *= 0.25;
+	return float4(d, d, d, 1.0);
+}
+
+/* ------------------------------------------------------------------ */
+/* DebugFlow: HSV colour-wheel visualisation of the forward flow.     */
+
+float3 hsv2rgb(float3 c)
+{
+	float3 rgb = saturate(float3(abs(c.x * 6.0 - 3.0) - 1.0,
+				     2.0 - abs(c.x * 6.0 - 2.0),
+				     2.0 - abs(c.x * 6.0 - 4.0)));
+	return c.z * lerp(float3(1.0, 1.0, 1.0), rgb, c.y);
+}
+
+float4 PSDebugFlow(VertData v_in) : TARGET
+{
+	float4 fl = flow_tex.Sample(smpLinear, v_in.uv);
+	float2 vf = fl.xy * frame_px;
+	float ang = atan2(vf.y, vf.x) / 6.2831853 + 0.5;
+	float mag = saturate(length(vf) * debug_mag * 0.02);
+	float3 col = hsv2rgb(float3(ang, 1.0, mag));
+	float4 orig = image.Sample(smpLinear, v_in.uv);
+	return float4(orig.rgb * 0.2 + col * 0.8, 1.0);
+}
+
+/* ------------------------------------------------------------------ */
+/* Split: left half = plain duplication, right half = interpolated.   */
+/* image = interpolated result, image2 = nearest original frame.      */
+
+float4 PSSplit(VertData v_in) : TARGET
+{
+	if (abs(v_in.uv.x - 0.5) < 0.0015)
+		return float4(1.0, 0.35, 0.0, 1.0);
+	if (v_in.uv.x < 0.5)
+		return image2.Sample(smpLinear, v_in.uv);
+	return image.Sample(smpLinear, v_in.uv);
+}
+
+/* ------------------------------------------------------------------ */
+
+technique Pack
+{
+	pass
+	{
+		vertex_shader = VSDefault(v_in);
+		pixel_shader  = PSPack(v_in);
+	}
+}
+
+technique Down
+{
+	pass
+	{
+		vertex_shader = VSDefault(v_in);
+		pixel_shader  = PSDown(v_in);
+	}
+}
+
+technique Motion
+{
+	pass
+	{
+		vertex_shader = VSDefault(v_in);
+		pixel_shader  = PSMotion(v_in);
+	}
+}
+
+technique SmoothFlow
+{
+	pass
+	{
+		vertex_shader = VSDefault(v_in);
+		pixel_shader  = PSSmoothFlow(v_in);
+	}
+}
+
+technique Interp
+{
+	pass
+	{
+		vertex_shader = VSDefault(v_in);
+		pixel_shader  = PSInterp(v_in);
+	}
+}
+
+technique Copy
+{
+	pass
+	{
+		vertex_shader = VSDefault(v_in);
+		pixel_shader  = PSCopy(v_in);
+	}
+}
+
+technique Diff
+{
+	pass
+	{
+		vertex_shader = VSDefault(v_in);
+		pixel_shader  = PSDiff(v_in);
+	}
+}
+
+technique DebugFlow
+{
+	pass
+	{
+		vertex_shader = VSDefault(v_in);
+		pixel_shader  = PSDebugFlow(v_in);
+	}
+}
+
+technique Split
+{
+	pass
+	{
+		vertex_shader = VSDefault(v_in);
+		pixel_shader  = PSSplit(v_in);
+	}
+}
