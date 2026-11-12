@@ -4,6 +4,7 @@
     release-notes.py --version 1.1.0 [--check]
                      [--repo owner/name] [--previous-tag v1.0.0] [--obs-version 32.1.2]
 
+--allow-undated accepts an "Unreleased" entry (release previews only).
 --check only validates that CHANGELOG.md has a dated section for the
 version (used to fail a release early, before anything is built).
 Otherwise the filled-in .github/release-template.md is printed to stdout.
@@ -37,10 +38,15 @@ def main() -> None:
     ap.add_argument("--repo", default="")
     ap.add_argument("--previous-tag", default="")
     ap.add_argument("--obs-version", default="")
+    ap.add_argument(
+        "--allow-undated",
+        action="store_true",
+        help="accept an undated (Unreleased) entry, for release previews",
+    )
     args = ap.parse_args()
 
     date, body = changelog_section(args.version)
-    if not re.fullmatch(r"\d{4}-\d{2}-\d{2}", date):
+    if not args.allow_undated and not re.fullmatch(r"\d{4}-\d{2}-\d{2}", date):
         sys.exit(
             f"CHANGELOG.md section [{args.version}] is dated '{date or '(none)'}' — "
             "set the release date (YYYY-MM-DD) before publishing"
