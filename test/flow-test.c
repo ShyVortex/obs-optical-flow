@@ -1,5 +1,5 @@
 /* End-to-end algorithm test for the optical-flow pipeline, standalone
- * against OBS.app's libobs — no OBS UI needed.
+ * against an installed OBS' libobs — no OBS UI needed.
  *
  * Synthesises two 640x360 frames: a textured 64x64 square on a dark
  * background, shifted +16 px in x between frame A and B. Runs the full
@@ -15,7 +15,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <graphics/graphics.h>
+#include "test-common.h"
 #include <graphics/vec2.h>
 #include <graphics/vec4.h>
 
@@ -94,22 +94,9 @@ static void draw_pass(gs_texrender_t *dst, uint32_t w, uint32_t h, const char *t
 
 int main(int argc, char **argv)
 {
-	const char *effect_path = (argc > 1) ? argv[1] : "data/effects/optical-flow.effect";
-	const char *module = "/Applications/OBS.app/Contents/Frameworks/libobs-opengl.dylib";
-
-	graphics_t *graphics = NULL;
-	if (gs_create(&graphics, module, 0) != GS_SUCCESS) {
-		fprintf(stderr, "gs_create failed\n");
-		return 2;
-	}
-	gs_enter_context(graphics);
-
-	char *err = NULL;
-	effect = gs_effect_create_from_file(effect_path, &err);
-	if (!effect) {
-		fprintf(stderr, "effect failed: %s\n", err ? err : "?");
-		return 3;
-	}
+	struct test_opts o = test_parse_args(argc, argv);
+	test_gs_create(&o);
+	effect = test_load_effect(o.effect);
 
 	/* source frames */
 	static uint8_t bufa[W * H * 4], bufb[W * H * 4];
@@ -215,6 +202,8 @@ int main(int argc, char **argv)
 	gs_effect_set_float(ep("t_phase"), 0.5f);
 	gs_effect_set_float(ep("occl_k"), 7.0f);
 	gs_effect_set_float(ep("strength"), 1.0f);
+	/* same as the filter: half a flow texel in source px */
+	gs_effect_set_float(ep("flow_quant"), 0.5f * (float)W / (float)pw[0]);
 	draw_pass(out, W, H, "Interp", tex_a);
 
 	gs_stagesurf_t *ostage = gs_stagesurface_create(W, H, GS_RGBA);

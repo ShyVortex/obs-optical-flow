@@ -7,8 +7,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <sys/time.h>
-#include <graphics/graphics.h>
+#include "test-common.h"
 #include <graphics/vec2.h>
 #include <graphics/vec4.h>
 
@@ -18,13 +17,6 @@
 #define ITERS 60
 
 static gs_effect_t *effect;
-
-static double now_ms(void)
-{
-	struct timeval tv;
-	gettimeofday(&tv, NULL);
-	return tv.tv_sec * 1000.0 + tv.tv_usec / 1000.0;
-}
 
 static void set_texel(const char *name, uint32_t w, uint32_t h)
 {
@@ -62,20 +54,11 @@ static void gpu_sync(gs_stagesurf_t *sync_stage, gs_texture_t *tex)
 		gs_stagesurface_unmap(sync_stage);
 }
 
-int main(void)
+int main(int argc, char **argv)
 {
-	graphics_t *graphics = NULL;
-	if (gs_create(&graphics, "/Applications/OBS.app/Contents/Frameworks/libobs-opengl.dylib", 0) !=
-	    GS_SUCCESS)
-		return 2;
-	gs_enter_context(graphics);
-
-	char *err = NULL;
-	effect = gs_effect_create_from_file("data/effects/optical-flow.effect", &err);
-	if (!effect) {
-		fprintf(stderr, "effect: %s\n", err ? err : "?");
-		return 3;
-	}
+	struct test_opts o = test_parse_args(argc, argv);
+	test_gs_create(&o);
+	effect = test_load_effect(o.effect);
 
 	/* noisy full-HD frames (worst case for matching: everything moves) */
 	static uint8_t bufa[W * H * 4], bufb[W * H * 4];
@@ -163,6 +146,7 @@ int main(void)
 		gs_effect_set_float(ep("t_phase"), 0.5f);                                                 \
 		gs_effect_set_float(ep("occl_k"), 7.0f);                                                  \
 		gs_effect_set_float(ep("strength"), 1.0f);                                                \
+		gs_effect_set_float(ep("flow_quant"), 0.5f * (float)W / (float)pw[0]);                    \
 		draw_pass(out, W, H, "Interp", tex_a);                                                    \
 	} while (0)
 
@@ -171,17 +155,17 @@ int main(void)
 	RUN_INTERP();
 	gpu_sync(sync_out, gs_texrender_get_texture(out));
 
-	double t0 = now_ms();
+	double t0 = test_now_ms();
 	for (int i = 0; i < ITERS; i++)
 		RUN_FLOW();
 	gpu_sync(sync_flow, gs_texrender_get_texture(fmed[0]));
-	double flow_ms = (now_ms() - t0) / ITERS;
+	double flow_ms = (test_now_ms() - t0) / ITERS;
 
-	t0 = now_ms();
+	t0 = test_now_ms();
 	for (int i = 0; i < ITERS; i++)
 		RUN_INTERP();
 	gpu_sync(sync_out, gs_texrender_get_texture(out));
-	double interp_ms = (now_ms() - t0) / ITERS;
+	double interp_ms = (test_now_ms() - t0) / ITERS;
 
 	printf("1080p flow computation (per new source frame): %.2f ms\n", flow_ms);
 	printf("1080p interp/warp pass (per canvas tick):      %.2f ms\n", interp_ms);

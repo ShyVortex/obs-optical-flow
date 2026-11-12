@@ -4,7 +4,7 @@
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
-#include <graphics/graphics.h>
+#include "test-common.h"
 #include <graphics/vec2.h>
 #include <graphics/vec4.h>
 
@@ -49,22 +49,11 @@ static void draw_pass(gs_texrender_t *dst, uint32_t w, uint32_t h, const char *t
 	gs_texrender_end(dst);
 }
 
-int main(void)
+int main(int argc, char **argv)
 {
-	graphics_t *graphics = NULL;
-	if (gs_create(&graphics, "/Applications/OBS.app/Contents/Frameworks/libobs-opengl.dylib", 0) !=
-	    GS_SUCCESS) {
-		fprintf(stderr, "gs_create failed\n");
-		return 2;
-	}
-	gs_enter_context(graphics);
-
-	char *err = NULL;
-	effect = gs_effect_create_from_file("data/effects/optical-flow.effect", &err);
-	if (!effect) {
-		fprintf(stderr, "effect failed: %s\n", err ? err : "?");
-		return 3;
-	}
+	struct test_opts o = test_parse_args(argc, argv);
+	test_gs_create(&o);
+	effect = test_load_effect(o.effect);
 
 	/* frame A: bright square at 200..264, frame B: shifted +16 */
 	static uint8_t bufa[W * H * 4], bufb[W * H * 4];

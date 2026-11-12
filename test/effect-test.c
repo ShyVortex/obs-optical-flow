@@ -1,37 +1,15 @@
 /* Standalone check: create a real libobs graphics context and compile an
- * .effect file through OBS' effect parser + shader transpiler.
- * Usage: effect-test <path-to-effect> [graphics-module-path] */
+ * .effect file through OBS' effect parser + shader transpiler (GLSL on
+ * OpenGL, HLSL on Direct3D 11).
+ * Usage: effect-test [--backend opengl|d3d11] [--adapter N] [--effect PATH | PATH] */
 
-#include <stdio.h>
-#include <graphics/graphics.h>
+#include "test-common.h"
 
 int main(int argc, char **argv)
 {
-	if (argc < 2) {
-		fprintf(stderr, "usage: %s <effect-file> [graphics-module]\n", argv[0]);
-		return 1;
-	}
-
-	const char *module = (argc > 2) ? argv[2]
-					: "/Applications/OBS.app/Contents/Frameworks/libobs-opengl.dylib";
-
-	graphics_t *graphics = NULL;
-	int ret = gs_create(&graphics, module, 0);
-	if (ret != GS_SUCCESS) {
-		fprintf(stderr, "gs_create failed: %d\n", ret);
-		return 2;
-	}
-
-	gs_enter_context(graphics);
-
-	char *err = NULL;
-	gs_effect_t *effect = gs_effect_create_from_file(argv[1], &err);
-	if (!effect) {
-		fprintf(stderr, "EFFECT COMPILE FAILED:\n%s\n", err ? err : "(no error string)");
-		gs_leave_context();
-		gs_destroy(graphics);
-		return 3;
-	}
+	struct test_opts o = test_parse_args(argc, argv);
+	graphics_t *graphics = test_gs_create(&o);
+	gs_effect_t *effect = test_load_effect(o.effect);
 
 	printf("EFFECT OK: all techniques compiled\n");
 
