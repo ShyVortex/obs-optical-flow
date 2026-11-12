@@ -52,11 +52,12 @@ jobs:
         run: cmake --build build --parallel
 
       # Hosted macOS runners are VMs with a paravirtualised GPU. Best effort
-      # until proven reliable; does not fail the build.
+      # until proven reliable; does not fail the build. perf-test is skipped:
+      # benchmarking a software rasterizer is meaningless and very slow.
       - name: Test (OpenGL)
         continue-on-error: true
         timeout-minutes: 10
-        run: ctest --test-dir build --timeout 120 --output-on-failure
+        run: ctest --test-dir build --timeout 120 -E perf-test --output-on-failure
 
       - name: Package
         id: package

@@ -52,12 +52,13 @@ jobs:
 
       # Software rendering (Mesa llvmpipe) on a virtual X server. Best effort
       # until proven reliable on hosted runners; does not fail the build.
+      # perf-test is skipped: benchmarking a software rasterizer is meaningless.
       - name: Test (OpenGL / llvmpipe)
         continue-on-error: true
         timeout-minutes: 10
         env:
           LIBGL_ALWAYS_SOFTWARE: "1"
-        run: xvfb-run -a ctest --test-dir build --timeout 120 --output-on-failure
+        run: xvfb-run -a ctest --test-dir build --timeout 120 -E perf-test --output-on-failure
 
       - name: Package
         id: package

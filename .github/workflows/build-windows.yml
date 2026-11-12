@@ -52,11 +52,12 @@ jobs:
         run: cmake --build build --config Release --parallel
 
       # Hosted runners have no GPU; D3D11 falls back to WARP (software).
-      # Best effort until proven reliable; does not fail the build.
+      # Best effort until proven reliable; does not fail the build. perf-test is skipped:
+      # benchmarking a software rasterizer is meaningless and very slow.
       - name: Test (D3D11 / WARP)
         continue-on-error: true
         timeout-minutes: 10
-        run: ctest --test-dir build --timeout 120 -C Release --output-on-failure -R d3d11
+        run: ctest --test-dir build --timeout 120 -E perf-test -C Release --output-on-failure -R d3d11
 
       - name: Package
         id: package
