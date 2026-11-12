@@ -6,8 +6,8 @@ name: Release
 #
 #   publish = false  build Linux, Windows and macOS; packages stay on the
 #                    run page as artifacts (90-day retention), plus a
-#                    release-preview artifact (notes + checksums) that
-#                    rehearses everything a release would publish
+#                    release-preview artifact (packages, checksums, notes)
+#                    holding exactly what a release would publish
 #   publish = true   additionally create the GitHub release v<version>
 #                    (version from CMakeLists.txt) with the packages,
 #                    SHA256SUMS.txt and notes built from
@@ -106,12 +106,30 @@ jobs:
         with:
           fetch-depth: 0 # tags, for the "compare with previous release" link
 
+      # The packages are uploaded unarchived (archive: false). download-artifact
+      # would *extract* the ones that are zip files, so download them raw,
+      # each into its own folder, and normalise to dist/<artifact name>.
       - name: Download plugin packages
         uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           pattern: obs-optical-flow-*
-          path: release/dist
-          merge-multiple: true
+          path: raw
+          skip-decompress: true
+
+      - name: Collect packages
+        run: |
+          find raw -ls
+          mkdir -p release/dist
+          for a in raw/*; do
+            name=$(basename "$a")
+            if [[ -d "$a" ]]; then
+              mapfile -t files < <(find "$a" -type f)
+              [[ ${#files[@]} -eq 1 ]] || { echo "::error::artifact $name holds ${#files[@]} files, expected 1"; exit 1; }
+              mv "${files[0]}" "release/dist/$name"
+            else
+              mv "$a" "release/dist/$name"
+            fi
+          done
 
       - name: Verify packages and write checksums
         working-directory: release/dist
@@ -136,13 +154,13 @@ jobs:
             ${{ !inputs.publish && '--allow-undated' || '' }} > release/notes.md
           cat release/notes.md >> "$GITHUB_STEP_SUMMARY"
 
+      # notes.md + dist/ (the three packages and SHA256SUMS.txt): exactly
+      # what the release job publishes.
       - name: Upload release preview
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: release-preview
-          path: |
-            release/notes.md
-            release/dist/SHA256SUMS.txt
+          path: release/
           if-no-files-found: error
 
   release:
@@ -156,13 +174,6 @@ jobs:
       V: ${{ needs.prepare.outputs.version }}
       GH_TOKEN: ${{ github.token }}
     steps:
-      - name: Download plugin packages
-        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
-        with:
-          pattern: obs-optical-flow-*
-          path: dist
-          merge-multiple: true
-
       - name: Download release preview
         uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
@@ -171,7 +182,8 @@ jobs:
 
       - name: Create release v${{ needs.prepare.outputs.version }}
         run: |
-          gh release create "v$V" dist/* preview/dist/SHA256SUMS.txt \
+          ls -l preview/dist
+          gh release create "v$V" preview/dist/* \
             -R "$GITHUB_REPOSITORY" \
             --target "$GITHUB_SHA" \
             --title "obs-optical-flow $V" \
