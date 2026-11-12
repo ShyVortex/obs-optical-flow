@@ -1,0 +1,137 @@
+name: Release
+
+# The orchestrator. Manual only (Actions tab -> Release -> Run workflow, or
+# `gh workflow run release.yml --ref <branch> -f publish=false`); no
+# workflow in this repository runs on push, pull request or schedule.
+#
+#   publish = false  build Linux, Windows and macOS; packages stay on the
+#                    run page as artifacts (90-day retention)
+#   publish = true   additionally create the GitHub release v<version>
+#                    (version from CMakeLists.txt) with the packages,
+#                    SHA256SUMS.txt and notes built from
+#                    .github/release-template.md + the CHANGELOG.md section
+#   draft   = true   (with publish) create the release as a draft, so it can
+#                    be reviewed and published from the Releases page
+
+on:
+  workflow_dispatch:
+    inputs:
+      publish:
+        description: Publish a GitHub release (otherwise only build artifacts)
+        type: boolean
+        default: false
+      draft:
+        description: Create the release as a draft (only with publish)
+        type: boolean
+        default: true
+
+# One release run at a time; a second one waits instead of racing for the tag.
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+env:
+  OBS_VERSION: "32.1.2" # OBS Studio release every platform builds against
+
+jobs:
+  # Validate everything a release needs *before* spending runner time.
+  prepare:
+    name: Prepare
+    runs-on: ubuntu-24.04
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      obs-version: ${{ steps.version.outputs.obs-version }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Read project version
+        id: version
+        run: |
+          V=$(.github/scripts/project-version.sh)
+          echo "version=$V" >> "$GITHUB_OUTPUT"
+          echo "obs-version=$OBS_VERSION" >> "$GITHUB_OUTPUT"
+          echo "### obs-optical-flow $V (publish: ${{ inputs.publish }}, draft: ${{ inputs.draft }})" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Check release preconditions
+        if: inputs.publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+          V: ${{ steps.version.outputs.version }}
+        run: |
+          if [[ "$GITHUB_REF" != "refs/heads/main" ]]; then
+            echo "::error::Releases can only be published from main (this run is on $GITHUB_REF). Re-run with publish=false, or merge first."
+            exit 1
+          fi
+          if gh release view "v$V" -R "$GITHUB_REPOSITORY" > /dev/null 2>&1 \
+             || git ls-remote --exit-code --tags origin "refs/tags/v$V" > /dev/null; then
+            echo "::error::Release/tag v$V already exists. Bump the version in CMakeLists.txt."
+            exit 1
+          fi
+          python3 .github/scripts/release-notes.py --version "$V" --check
+
+  linux:
+    needs: prepare
+    uses: ./.github/workflows/build-linux.yml
+    with:
+      obs-version: ${{ needs.prepare.outputs.obs-version }}
+
+  windows:
+    needs: prepare
+    uses: ./.github/workflows/build-windows.yml
+    with:
+      obs-version: ${{ needs.prepare.outputs.obs-version }}
+
+  macos:
+    needs: prepare
+    uses: ./.github/workflows/build-macos.yml
+    with:
+      obs-version: ${{ needs.prepare.outputs.obs-version }}
+
+  release:
+    name: Publish release
+    needs: [prepare, linux, windows, macos]
+    if: inputs.publish
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write # create the tag and the release; nothing else
+    env:
+      V: ${{ needs.prepare.outputs.version }}
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0 # tags, for the "compare with previous release" link
+
+      - name: Download plugin packages
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          pattern: obs-optical-flow-*
+          path: dist
+          merge-multiple: true
+
+      - name: Checksums
+        working-directory: dist
+        run: |
+          ls -l
+          test "$(ls | wc -l)" -eq 3 || { echo "::error::expected 3 packages"; exit 1; }
+          sha256sum * > SHA256SUMS.txt
+          cat SHA256SUMS.txt
+
+      - name: Release notes
+        run: |
+          PREV=$(git tag -l 'v*' --sort=-v:refname | grep -vx "v$V" | head -n1 || true)
+          python3 .github/scripts/release-notes.py --version "$V" \
+            --repo "$GITHUB_REPOSITORY" --previous-tag "$PREV" \
+            --obs-version "${{ needs.prepare.outputs.obs-version }}" > notes.md
+          cat notes.md >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Create release v${{ needs.prepare.outputs.version }}
+        run: |
+          gh release create "v$V" dist/* \
+            --target "$GITHUB_SHA" \
+            --title "obs-optical-flow $V" \
+            --notes-file notes.md \
+            ${{ inputs.draft && '--draft' || '' }}

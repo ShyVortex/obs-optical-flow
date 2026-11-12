@@ -20,7 +20,9 @@ foreach(_t IN LISTS OBS_TESTS)
 		target_link_libraries(${_t} PRIVATE m ${CMAKE_DL_LIBS})
 	endif()
 	if(APPLE)
-		set_target_properties(${_t} PROPERTIES BUILD_RPATH "${OBS_APP}/Contents/Frameworks")
+		set_target_properties(${_t} PROPERTIES
+			BUILD_RPATH "${OBS_APP}/Contents/Frameworks"
+			INSTALL_RPATH "${OBS_APP}/Contents/Frameworks")
 	endif()
 
 	foreach(_b IN LISTS OBS_TEST_BACKENDS)

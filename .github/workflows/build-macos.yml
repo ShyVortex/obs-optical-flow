@@ -1,0 +1,85 @@
+name: Build (macOS)
+
+# Manual only: started by release.yml, or on its own from the Actions tab
+# to re-run just this platform. Never triggered by pushes.
+on:
+  workflow_call:
+    inputs:
+      obs-version:
+        description: OBS Studio release to build against
+        type: string
+        default: "32.1.2"
+  workflow_dispatch:
+    inputs:
+      obs-version:
+        description: OBS Studio release to build against
+        type: string
+        default: "32.1.2"
+
+permissions:
+  contents: read
+
+env:
+  OBS_VERSION: ${{ inputs.obs-version }} # OBS.app whose libobs.framework is linked
+
+jobs:
+  build:
+    name: macOS arm64
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Read project version
+        id: version
+        run: echo "version=$(.github/scripts/project-version.sh)" >> "$GITHUB_OUTPUT"
+
+      - name: Install OBS Studio ${{ env.OBS_VERSION }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release download "$OBS_VERSION" -R obsproject/obs-studio \
+            -p "OBS-Studio-$OBS_VERSION-macOS-Apple.dmg" -D "$RUNNER_TEMP"
+          MNT=$(hdiutil attach -nobrowse -readonly "$RUNNER_TEMP/OBS-Studio-$OBS_VERSION-macOS-Apple.dmg" \
+                | awk -F'\t' '/\/Volumes\//{print $NF}')
+          sudo cp -R "$MNT/OBS.app" /Applications/
+          hdiutil detach "$MNT"
+          test -d /Applications/OBS.app/Contents/Frameworks/libobs.framework
+
+      - name: Configure
+        run: cmake -B build -DCMAKE_BUILD_TYPE=Release -DBUILD_TESTS=ON
+
+      - name: Build
+        run: cmake --build build --parallel
+
+      # Hosted macOS runners are VMs with a paravirtualised GPU. Best effort
+      # until proven reliable; does not fail the build.
+      - name: Test (OpenGL)
+        continue-on-error: true
+        run: ctest --test-dir build --output-on-failure
+
+      - name: Package
+        id: package
+        run: |
+          V="${{ steps.version.outputs.version }}"
+          cmake --install build --prefix stage
+          cmake --install build --component tests --prefix stage-tests
+          cp test/run-tests.sh stage-tests/
+          codesign --verify --verbose stage/obs-optical-flow.plugin
+          PKG="obs-optical-flow-$V-macos-arm64.zip"
+          # ditto keeps the bundle structure and code signature intact
+          ditto -c -k --keepParent stage/obs-optical-flow.plugin "$PKG"
+          echo "package=$PKG" >> "$GITHUB_OUTPUT"
+
+      - name: Upload plugin package
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          path: ${{ steps.package.outputs.package }}
+          archive: false
+          if-no-files-found: error
+
+      - name: Upload test harnesses
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: tests-macos-arm64
+          path: stage-tests/
+          if-no-files-found: error

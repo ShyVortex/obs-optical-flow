@@ -19,7 +19,7 @@ if(APPLE)
 	set(CMAKE_OSX_ARCHITECTURES "arm64" CACHE STRING "macOS architectures")
 endif()
 
-project(obs-optical-flow VERSION 1.0.0 LANGUAGES C)
+project(obs-optical-flow VERSION 1.1.0 LANGUAGES C)
 
 set(CMAKE_C_STANDARD 17)
 set(CMAKE_C_STANDARD_REQUIRED ON)
@@ -54,7 +54,8 @@ elseif(APPLE)
 	set_target_properties(OBS::libobs PROPERTIES INTERFACE_LINK_LIBRARIES "${OBS_LIBOBS}")
 else()
 	set(OBS_LIB_DIR "" CACHE PATH "Optional extra directory to search for libobs.so")
-	find_library(OBS_LIBOBS NAMES obs libobs.so.0 HINTS "${OBS_LIB_DIR}")
+	# libobs.so is a dev symlink some packages (e.g. the official .deb) lack
+	find_library(OBS_LIBOBS NAMES obs libobs.so.30 libobs.so.0 HINTS "${OBS_LIB_DIR}")
 	if(NOT OBS_LIBOBS)
 		message(FATAL_ERROR "libobs.so not found — install OBS Studio (or libobs-dev) or set -DOBS_LIB_DIR=...")
 	endif()
@@ -128,6 +129,8 @@ endif()
 
 if(APPLE)
 	install(TARGETS obs-optical-flow LIBRARY DESTINATION . BUNDLE DESTINATION .)
+	# install may rewrite the binary's rpaths, which invalidates the signature
+	install(CODE "execute_process(COMMAND codesign --force --sign - \"\${CMAKE_INSTALL_PREFIX}/obs-optical-flow.plugin\" COMMAND_ERROR_IS_FATAL ANY)")
 else()
 	install(TARGETS obs-optical-flow
 		LIBRARY DESTINATION obs-optical-flow/bin/64bit   # .so
