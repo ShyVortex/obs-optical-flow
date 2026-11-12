@@ -41,6 +41,19 @@ static float h2f(uint16_t h)
 	return sign ? -f : f;
 }
 
+/* FNV-1a over the meaningful bytes of a mapped surface (row padding
+ * excluded): bit-exact regression fingerprint of a pass's output. */
+static uint32_t surface_hash(const uint8_t *data, uint32_t linesize, uint32_t row_bytes, uint32_t rows)
+{
+	uint32_t h = 2166136261u;
+	for (uint32_t y = 0; y < rows; y++)
+		for (uint32_t x = 0; x < row_bytes; x++) {
+			h ^= data[(size_t)y * linesize + x];
+			h *= 16777619u;
+		}
+	return h;
+}
+
 static void fill_frame(uint8_t *px, int sq_x)
 {
 	for (int y = 0; y < H; y++) {
@@ -185,6 +198,7 @@ int main(int argc, char **argv)
 	int bx = 40 * (int)pw[0] / W, by = 40 * (int)ph[0] / H;
 	const uint16_t *bp = (const uint16_t *)(data + (size_t)by * linesize) + (size_t)bx * 4;
 	float bfx = h2f(bp[0]) * W, bfy = h2f(bp[1]) * H;
+	uint32_t flow_hash = surface_hash(data, linesize, pw[0] * 8, ph[0]);
 	gs_stagesurface_unmap(fstage);
 
 	printf("flow @ square centre: fwd=(%+.2f, %+.2f) px  bwd=(%+.2f, %+.2f) px (expect fwd ~ +16,0; bwd ~ -16,0)\n",
@@ -225,6 +239,7 @@ int main(int argc, char **argv)
 			last = x;
 		}
 	}
+	uint32_t out_hash = surface_hash(data, linesize, W * 4, H);
 	gs_stagesurface_unmap(ostage);
 
 	int exp_first = (AX + BX) / 2; /* 208 */
@@ -249,6 +264,8 @@ int main(int argc, char **argv)
 		ok = 0;
 	}
 
+	printf("fingerprints: flow=%08x interp=%08x (bit-exact output; GPU/driver specific)\n", flow_hash,
+	       out_hash);
 	printf(ok ? "ALL CHECKS PASSED\n" : "TEST FAILED\n");
 
 	gs_leave_context();

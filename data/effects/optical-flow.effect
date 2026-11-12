@@ -5,6 +5,12 @@
 // All passes are single-render-target fragment work; loops use constant
 // bounds so the transpiled GLSL compiles everywhere.
 //
+// Every texture read is SampleLevel(..., 0.0) rather than Sample(): no
+// texture here has mipmaps, so the result is identical, but explicit-LOD
+// reads need no screen-space derivatives. The D3D11 HLSL compiler rejects
+// (error X4014) or force-unrolls (warning X3570) derivative-based Sample()
+// inside loops and dynamic branches, which PSMotion's search is full of.
+//
 // Flow vectors are stored in UV units (0..1 across the texture) so they can
 // be sampled across pyramid levels without rescaling.
 // Flow texture layout: xy = forward flow (A -> B), zw = backward flow (B -> A).
@@ -69,14 +75,14 @@ float4 PSPack(VertData v_in) : TARGET
 	float2 o = texel;
 	float a = 0.0;
 	float b = 0.0;
-	a += lum(image.Sample(smpLinear, v_in.uv + float2(-o.x, -o.y)));
-	a += lum(image.Sample(smpLinear, v_in.uv + float2( o.x, -o.y)));
-	a += lum(image.Sample(smpLinear, v_in.uv + float2(-o.x,  o.y)));
-	a += lum(image.Sample(smpLinear, v_in.uv + float2( o.x,  o.y)));
-	b += lum(image2.Sample(smpLinear, v_in.uv + float2(-o.x, -o.y)));
-	b += lum(image2.Sample(smpLinear, v_in.uv + float2( o.x, -o.y)));
-	b += lum(image2.Sample(smpLinear, v_in.uv + float2(-o.x,  o.y)));
-	b += lum(image2.Sample(smpLinear, v_in.uv + float2( o.x,  o.y)));
+	a += lum(image.SampleLevel(smpLinear, v_in.uv + float2(-o.x, -o.y), 0.0));
+	a += lum(image.SampleLevel(smpLinear, v_in.uv + float2( o.x, -o.y), 0.0));
+	a += lum(image.SampleLevel(smpLinear, v_in.uv + float2(-o.x,  o.y), 0.0));
+	a += lum(image.SampleLevel(smpLinear, v_in.uv + float2( o.x,  o.y), 0.0));
+	b += lum(image2.SampleLevel(smpLinear, v_in.uv + float2(-o.x, -o.y), 0.0));
+	b += lum(image2.SampleLevel(smpLinear, v_in.uv + float2( o.x, -o.y), 0.0));
+	b += lum(image2.SampleLevel(smpLinear, v_in.uv + float2(-o.x,  o.y), 0.0));
+	b += lum(image2.SampleLevel(smpLinear, v_in.uv + float2( o.x,  o.y), 0.0));
 	return float4(a * 0.25, b * 0.25, 0.0, 1.0);
 }
 
@@ -85,7 +91,7 @@ float4 PSPack(VertData v_in) : TARGET
 
 float4 PSDown(VertData v_in) : TARGET
 {
-	return float4(image.Sample(smpLinear, v_in.uv).rg, 0.0, 1.0);
+	return float4(image.SampleLevel(smpLinear, v_in.uv, 0.0).rg, 0.0, 1.0);
 }
 
 /* ------------------------------------------------------------------ */
@@ -100,8 +106,8 @@ float sad_fwd(float2 uv, float2 mv)
 		for (int i = 0; i < 4; i++) {
 			float2 off = float2((float(i) - 1.5) * texel.x,
 					    (float(j) - 1.5) * texel.y);
-			float la = image.Sample(smpLinear, uv + off).r;
-			float lb = image.Sample(smpLinear, uv + mv + off).g;
+			float la = image.SampleLevel(smpLinear, uv + off, 0.0).r;
+			float lb = image.SampleLevel(smpLinear, uv + mv + off, 0.0).g;
 			s += abs(la - lb);
 		}
 	}
@@ -115,8 +121,8 @@ float sad_bwd(float2 uv, float2 mv)
 		for (int i = 0; i < 4; i++) {
 			float2 off = float2((float(i) - 1.5) * texel.x,
 					    (float(j) - 1.5) * texel.y);
-			float lb = image.Sample(smpLinear, uv + off).g;
-			float la = image.Sample(smpLinear, uv + mv + off).r;
+			float lb = image.SampleLevel(smpLinear, uv + off, 0.0).g;
+			float la = image.SampleLevel(smpLinear, uv + mv + off, 0.0).r;
 			s += abs(lb - la);
 		}
 	}
@@ -128,8 +134,8 @@ float4 PSMotion(VertData v_in) : TARGET
 	float2 uv = v_in.uv;
 	float2 best_f = float2(0.0, 0.0);
 	float2 best_b = float2(0.0, 0.0);
-	float cost_f;
-	float cost_b;
+	float cost_f = 1e9;
+	float cost_b = 1e9;
 
 	/* --- candidate stage ------------------------------------- */
 	if (has_prev > 0.5) {
@@ -143,7 +149,7 @@ float4 PSMotion(VertData v_in) : TARGET
 			if (k == 2) po = float2( 1.5, 0.0);
 			if (k == 3) po = float2(0.0, -1.5);
 			if (k == 4) po = float2(0.0,  1.5);
-			float4 pf = prev_flow.Sample(smpLinear, uv + po * flow_texel);
+			float4 pf = prev_flow.SampleLevel(smpLinear, uv + po * flow_texel, 0.0);
 			float cf = sad_fwd(uv, pf.xy);
 			float cb = sad_bwd(uv, pf.zw);
 			if (cf < cost_f) { cost_f = cf; best_f = pf.xy; }
@@ -162,7 +168,7 @@ float4 PSMotion(VertData v_in) : TARGET
 		/* ... plus the temporal candidate from the previous
 		   frame pair (3-D recursive search idea) */
 		if (has_temporal > 0.5) {
-			float4 tf = temporal_flow.Sample(smpLinear, uv);
+			float4 tf = temporal_flow.SampleLevel(smpLinear, uv, 0.0);
 			float cf = sad_fwd(uv, tf.xy);
 			float cb = sad_bwd(uv, tf.zw);
 			if (cf < cost_f) { cost_f = cf; best_f = tf.xy; }
@@ -218,15 +224,15 @@ float4 PSMotion(VertData v_in) : TARGET
 
 float4 PSSmoothFlow(VertData v_in) : TARGET
 {
-	float4 p0 = image.Sample(smpPoint, v_in.uv + float2(-texel.x, -texel.y));
-	float4 p1 = image.Sample(smpPoint, v_in.uv + float2(     0.0, -texel.y));
-	float4 p2 = image.Sample(smpPoint, v_in.uv + float2( texel.x, -texel.y));
-	float4 p3 = image.Sample(smpPoint, v_in.uv + float2(-texel.x,      0.0));
-	float4 p4 = image.Sample(smpPoint, v_in.uv);
-	float4 p5 = image.Sample(smpPoint, v_in.uv + float2( texel.x,      0.0));
-	float4 p6 = image.Sample(smpPoint, v_in.uv + float2(-texel.x,  texel.y));
-	float4 p7 = image.Sample(smpPoint, v_in.uv + float2(     0.0,  texel.y));
-	float4 p8 = image.Sample(smpPoint, v_in.uv + float2( texel.x,  texel.y));
+	float4 p0 = image.SampleLevel(smpPoint, v_in.uv + float2(-texel.x, -texel.y), 0.0);
+	float4 p1 = image.SampleLevel(smpPoint, v_in.uv + float2(     0.0, -texel.y), 0.0);
+	float4 p2 = image.SampleLevel(smpPoint, v_in.uv + float2( texel.x, -texel.y), 0.0);
+	float4 p3 = image.SampleLevel(smpPoint, v_in.uv + float2(-texel.x,      0.0), 0.0);
+	float4 p4 = image.SampleLevel(smpPoint, v_in.uv, 0.0);
+	float4 p5 = image.SampleLevel(smpPoint, v_in.uv + float2( texel.x,      0.0), 0.0);
+	float4 p6 = image.SampleLevel(smpPoint, v_in.uv + float2(-texel.x,  texel.y), 0.0);
+	float4 p7 = image.SampleLevel(smpPoint, v_in.uv + float2(     0.0,  texel.y), 0.0);
+	float4 p8 = image.SampleLevel(smpPoint, v_in.uv + float2( texel.x,  texel.y), 0.0);
 
 	/* classic 9-element median exchange network (component-wise) */
 	float4 t;
@@ -261,7 +267,7 @@ float4 PSSmoothFlow(VertData v_in) : TARGET
 float4 PSInterp(VertData v_in) : TARGET
 {
 	float2 uv = v_in.uv;
-	float4 fl = flow_tex.Sample(smpLinear, uv);
+	float4 fl = flow_tex.SampleLevel(smpLinear, uv, 0.0);
 	float2 vf = fl.xy;
 	float2 vb = fl.zw;
 
@@ -270,8 +276,8 @@ float4 PSInterp(VertData v_in) : TARGET
 	 * searches round independently, so up to ~flow_quant of disagreement
 	 * is measurement noise, not occlusion — folded into the limit so
 	 * confidence does not collapse on slow pans. */
-	float4 flf = flow_tex.Sample(smpLinear, uv + vf);
-	float4 flb = flow_tex.Sample(smpLinear, uv + vb);
+	float4 flf = flow_tex.SampleLevel(smpLinear, uv + vf, 0.0);
+	float4 flb = flow_tex.SampleLevel(smpLinear, uv + vb, 0.0);
 	float2 ef_px = (vf + flf.zw) * frame_px;
 	float2 eb_px = (vb + flb.xy) * frame_px;
 	float2 vf_px = vf * frame_px;
@@ -285,16 +291,16 @@ float4 PSInterp(VertData v_in) : TARGET
 	/* motion-compensated samples.
 	 * A-pixel p lands at p + t*vf  ->  p ~ x - t*vf(x)
 	 * B-pixel q lands at q + (1-t)*vb  ->  q ~ x - (1-t)*vb(x) */
-	float4 colA = image.Sample(smpLinear, uv - vf * t_phase);
-	float4 colB = image2.Sample(smpLinear, uv - vb * (1.0 - t_phase));
+	float4 colA = image.SampleLevel(smpLinear, uv - vf * t_phase, 0.0);
+	float4 colB = image2.SampleLevel(smpLinear, uv - vb * (1.0 - t_phase), 0.0);
 
 	float wa = (1.0 - t_phase) * cf;
 	float wb = t_phase * cb;
 	float4 mc = (colA * wa + colB * wb) / (wa + wb + 1e-6);
 
 	/* fallback: plain cross-fade where flow is unreliable */
-	float4 xa = image.Sample(smpLinear, uv);
-	float4 xb = image2.Sample(smpLinear, uv);
+	float4 xa = image.SampleLevel(smpLinear, uv, 0.0);
+	float4 xb = image2.SampleLevel(smpLinear, uv, 0.0);
 	float4 xf = lerp(xa, xb, t_phase);
 
 	float conf = saturate(max(cf, cb));
@@ -306,7 +312,7 @@ float4 PSInterp(VertData v_in) : TARGET
 
 float4 PSCopy(VertData v_in) : TARGET
 {
-	return image.Sample(smpLinear, v_in.uv);
+	return image.SampleLevel(smpLinear, v_in.uv, 0.0);
 }
 
 /* ------------------------------------------------------------------ */
@@ -321,14 +327,14 @@ float4 PSDiff(VertData v_in) : TARGET
 {
 	float2 o = texel;
 	float d = 0.0;
-	d += abs(lum(image.Sample(smpLinear, v_in.uv + float2(-o.x, -o.y))) -
-		 lum(image2.Sample(smpLinear, v_in.uv + float2(-o.x, -o.y))));
-	d += abs(lum(image.Sample(smpLinear, v_in.uv + float2( o.x, -o.y))) -
-		 lum(image2.Sample(smpLinear, v_in.uv + float2( o.x, -o.y))));
-	d += abs(lum(image.Sample(smpLinear, v_in.uv + float2(-o.x,  o.y))) -
-		 lum(image2.Sample(smpLinear, v_in.uv + float2(-o.x,  o.y))));
-	d += abs(lum(image.Sample(smpLinear, v_in.uv + float2( o.x,  o.y))) -
-		 lum(image2.Sample(smpLinear, v_in.uv + float2( o.x,  o.y))));
+	d += abs(lum(image.SampleLevel(smpLinear, v_in.uv + float2(-o.x, -o.y), 0.0)) -
+		 lum(image2.SampleLevel(smpLinear, v_in.uv + float2(-o.x, -o.y), 0.0)));
+	d += abs(lum(image.SampleLevel(smpLinear, v_in.uv + float2( o.x, -o.y), 0.0)) -
+		 lum(image2.SampleLevel(smpLinear, v_in.uv + float2( o.x, -o.y), 0.0)));
+	d += abs(lum(image.SampleLevel(smpLinear, v_in.uv + float2(-o.x,  o.y), 0.0)) -
+		 lum(image2.SampleLevel(smpLinear, v_in.uv + float2(-o.x,  o.y), 0.0)));
+	d += abs(lum(image.SampleLevel(smpLinear, v_in.uv + float2( o.x,  o.y), 0.0)) -
+		 lum(image2.SampleLevel(smpLinear, v_in.uv + float2( o.x,  o.y), 0.0)));
 	d *= 0.25;
 	return float4(d, d, d, 1.0);
 }
@@ -346,12 +352,12 @@ float3 hsv2rgb(float3 c)
 
 float4 PSDebugFlow(VertData v_in) : TARGET
 {
-	float4 fl = flow_tex.Sample(smpLinear, v_in.uv);
+	float4 fl = flow_tex.SampleLevel(smpLinear, v_in.uv, 0.0);
 	float2 vf = fl.xy * frame_px;
 	float ang = atan2(vf.y, vf.x) / 6.2831853 + 0.5;
 	float mag = saturate(length(vf) * debug_mag * 0.02);
 	float3 col = hsv2rgb(float3(ang, 1.0, mag));
-	float4 orig = image.Sample(smpLinear, v_in.uv);
+	float4 orig = image.SampleLevel(smpLinear, v_in.uv, 0.0);
 	return float4(orig.rgb * 0.2 + col * 0.8, 1.0);
 }
 
@@ -364,8 +370,8 @@ float4 PSSplit(VertData v_in) : TARGET
 	if (abs(v_in.uv.x - 0.5) < 0.0015)
 		return float4(1.0, 0.35, 0.0, 1.0);
 	if (v_in.uv.x < 0.5)
-		return image2.Sample(smpLinear, v_in.uv);
-	return image.Sample(smpLinear, v_in.uv);
+		return image2.SampleLevel(smpLinear, v_in.uv, 0.0);
+	return image.SampleLevel(smpLinear, v_in.uv, 0.0);
 }
 
 /* ------------------------------------------------------------------ */
