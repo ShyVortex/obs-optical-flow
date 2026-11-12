@@ -55,7 +55,8 @@ jobs:
       # until proven reliable; does not fail the build.
       - name: Test (OpenGL)
         continue-on-error: true
-        run: ctest --test-dir build --output-on-failure
+        timeout-minutes: 10
+        run: ctest --test-dir build --timeout 120 --output-on-failure
 
       - name: Package
         id: package

@@ -55,7 +55,8 @@ jobs:
       # Best effort until proven reliable; does not fail the build.
       - name: Test (D3D11 / WARP)
         continue-on-error: true
-        run: ctest --test-dir build -C Release --output-on-failure -R d3d11
+        timeout-minutes: 10
+        run: ctest --test-dir build --timeout 120 -C Release --output-on-failure -R d3d11
 
       - name: Package
         id: package
